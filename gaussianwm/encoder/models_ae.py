@@ -108,11 +108,21 @@ class Attention(nn.Module):
 
 
 class PointEmbed(nn.Module):
-    def __init__(self, hidden_dim=48, dim=128):
+    def __init__(self, hidden_dim=48, dim=128, point_dim=14):
+        """
+        Args:
+            hidden_dim: size of sinusoidal XYZ positional encoding
+            dim:        output embedding dimension
+            point_dim:  total number of features per point.
+                        Default 14 (original GWM).
+                        Set to 26 when physics features are appended
+                        (14 geometry + 12 physics).
+        """
         super().__init__()
         assert hidden_dim % 6 == 0, "Hidden dim must be divisible by 6 for XYZ positional encoding"
         self.embedding_dim = hidden_dim
-        
+        self.point_dim = point_dim
+
         # Positional encoding basis for XYZ coordinates
         e = torch.pow(2, torch.arange(hidden_dim // 6)).float() * np.pi
         e = torch.stack([
@@ -122,8 +132,8 @@ class PointEmbed(nn.Module):
         ])
         self.register_buffer('basis', e)  # 3 x (hidden_dim//2)
 
-        # MLP processes: positional_embeddings + original_xyz + other_features
-        self.mlp = nn.Linear(hidden_dim + 14, dim)  # 14 = 3(xyz) + 11(other features)
+        # MLP processes: positional_embeddings(hidden_dim) + all point features(point_dim)
+        self.mlp = nn.Linear(hidden_dim + point_dim, dim)
 
     @staticmethod
     def embed(input, basis):
@@ -133,14 +143,14 @@ class PointEmbed(nn.Module):
         return embeddings  # [B, N, hidden_dim]
     
     def forward(self, input):
-        # input: [B, N, 14] full point cloud features
-        xyz = input[..., :3]    # [B, N, 3]
-        other_features = input[..., 3:] # [B, N, 11]
-        
+        # input: [B, N, point_dim] full point cloud features
+        xyz = input[..., :3]   # [B, N, 3] — always the first 3 dims are XYZ
+
         # Get positional embeddings for XYZ
-        pos_embed = self.embed(xyz, self.basis) # [B, N, hidden_dim], e.g., [64, 64, 48]
-        
-        combined = torch.cat([pos_embed, xyz, other_features], dim=-1)  # 48+3+11=62
+        pos_embed = self.embed(xyz, self.basis)  # [B, N, hidden_dim]
+
+        # Concat positional encoding with ALL input features → (hidden_dim + point_dim) → dim
+        combined = torch.cat([pos_embed, input], dim=-1)
         return self.mlp(combined)
 
 
@@ -171,7 +181,7 @@ class DiagonalGaussianDistribution(object):
                 return 0.5 * torch.mean(
                     torch.pow(self.mean - other.mean, 2) / other.var
                     + self.var / other.var - 1.0 - self.logvar + other.logvar,
-                    dim=[1, 2, 3])
+                    dim=[1, 2])  # bug fix: mean is [B,M,D] (3D), not 4D
 
     def nll(self, sample, dims=[1,2,3]):
         if self.deterministic:
@@ -198,6 +208,7 @@ class AutoEncoder(nn.Module):
         dim_head=64,
         weight_tie_layers=False,
         decoder_ff=False,
+        point_dim=14,   # 14 = original geometry; 26 = geometry + physics
     ):
         super().__init__()
 
@@ -211,7 +222,7 @@ class AutoEncoder(nn.Module):
             PreNorm(dim, FeedForward(dim))
         ])
 
-        self.point_embed = PointEmbed(dim=dim)
+        self.point_embed = PointEmbed(dim=dim, point_dim=point_dim)
 
         get_latent_attn = lambda: PreNorm(dim, Attention(dim, heads = heads, dim_head = dim_head, drop_path_rate=0.1))
         get_latent_ff = lambda: PreNorm(dim, FeedForward(dim, drop_path_rate=0.1))
@@ -232,18 +243,16 @@ class AutoEncoder(nn.Module):
         self.to_outputs = nn.Linear(queries_dim, output_dim) if exists(output_dim) else nn.Identity()
 
     def encode(self, pc):
-        # pc: B x N x D (D=14: xyz + features)
+        # pc: B x N x D (D = point_dim, default 14; 26 with physics features)
         B, N, D = pc.shape
         assert N == self.num_inputs, f"Expected {self.num_inputs} point cloud inputs, got {N}"
 
         ###### FPS sampling based on XYZ coordinates
         _, sampled_indices = fps(pc[..., :3], K=self.num_latents)
         sampled_pc = torch.gather(pc, 1, 
-            sampled_indices.unsqueeze(-1).expand(-1,-1,D))  # [B, K, 14], e.g., []
+            sampled_indices.unsqueeze(-1).expand(-1,-1,D))  # [B, K, D]
 
-        # print(f"{sampled_pc.shape=}") # [B, K ,3], e.g., [64, 128, 3]
-
-        ###### Embed full 14D features
+        ###### Embed full D-dim features
         sampled_pc_embeddings = self.point_embed(sampled_pc)  # [B, K, C]
         pc_embeddings = self.point_embed(pc)  # [B, N, C]
 
@@ -297,7 +306,8 @@ class KLAutoEncoder(nn.Module):
         heads = 8,
         dim_head = 64,
         weight_tie_layers = False,
-        decoder_ff = False
+        decoder_ff = False,
+        point_dim = 14,   # 14 = original geometry; 26 = geometry + physics
     ):
         super().__init__()
 
@@ -311,7 +321,7 @@ class KLAutoEncoder(nn.Module):
             PreNorm(dim, FeedForward(dim))
         ])
 
-        self.point_embed = PointEmbed(dim=dim)
+        self.point_embed = PointEmbed(dim=dim, point_dim=point_dim)
 
         get_latent_attn = lambda: PreNorm(dim, Attention(dim, heads = heads, dim_head = dim_head, drop_path_rate=0.1))
         get_latent_ff = lambda: PreNorm(dim, FeedForward(dim, drop_path_rate=0.1))
@@ -337,46 +347,33 @@ class KLAutoEncoder(nn.Module):
         self.logvar_fc = nn.Linear(dim, latent_dim)
 
     def encode(self, pc):
-        # pc: B x N x 3
+        # pc: [B, N, D]   D = point_dim (14 geometry, or 26 with physics)
         B, N, D = pc.shape
-        assert N == self.num_inputs
-        
-        ###### fps
-        flattened = pc.view(B*N, D)
+        assert N == self.num_inputs, f"Expected {self.num_inputs} points, got {N}"
 
-        batch = torch.arange(B).to(pc.device)
-        batch = torch.repeat_interleave(batch, N)
+        # FPS on XYZ only (first 3 dims) — bug-fix: was running FPS on all D dims
+        _, sampled_idx = fps(pc[..., :3], K=self.num_latents)  # [B, M]
+        sampled_pc = torch.gather(
+            pc, 1,
+            sampled_idx.unsqueeze(-1).expand(-1, -1, D)
+        )  # [B, M, D]  — bug-fix: was hardcoded view(..., 3)
 
-        pos = flattened
-
-        ratio = 1.0 * self.num_latents / self.num_inputs
-        
-        K = int(N * ratio)
-        batch_tensor = batch.view(-1, 1).repeat(1, 3)
-        _, idx = fps(pos.unsqueeze(0), K=K)
-        idx = idx.squeeze(0)
-        
-        sampled_pc = pos[idx]
-        sampled_pc = sampled_pc.view(B, -1, 3)
-        ######
-
-        sampled_pc_embeddings = self.point_embed(sampled_pc)
-
-        pc_embeddings = self.point_embed(pc)
+        sampled_pc_embeddings = self.point_embed(sampled_pc)  # [B, M, dim]
+        pc_embeddings          = self.point_embed(pc)          # [B, N, dim]
 
         cross_attn, cross_ff = self.cross_attend_blocks
+        x = cross_attn(sampled_pc_embeddings, context=pc_embeddings) + sampled_pc_embeddings
+        x = cross_ff(x) + x   # [B, M, dim]
 
-        x = cross_attn(sampled_pc_embeddings, context = pc_embeddings, mask = None) + sampled_pc_embeddings
-        x = cross_ff(x) + x
-
-        mean = self.mean_fc(x)
+        mean   = self.mean_fc(x)    # [B, M, latent_dim]
         logvar = self.logvar_fc(x)
 
         posterior = DiagonalGaussianDistribution(mean, logvar)
-        x = posterior.sample()
+        x  = posterior.sample()
         kl = posterior.kl()
 
-        return kl, x
+        # Also return sampled_pc so callers can use it as decoder queries
+        return kl, x, sampled_pc
 
 
     def decode(self, x, queries):
@@ -397,16 +394,16 @@ class KLAutoEncoder(nn.Module):
         
         return self.to_outputs(latents)
 
-    def forward(self, pc, queries):
-        kl, x = self.encode(pc)
-
+    def forward(self, pc, queries=None):
+        kl, x, sampled_pc = self.encode(pc)
+        # Use sampled_pc as decoder queries if none provided
+        queries = queries if queries is not None else sampled_pc
         o = self.decode(x, queries).squeeze(-1)
-
-        # return o.squeeze(-1), kl
         return {'logits': o, 'kl': kl}
 
 def create_autoencoder(
-        dim=512, M=512, depth=24, latent_dim=64, output_dim=1, N=2048, deterministic=False
+        dim=512, M=512, depth=24, latent_dim=64, output_dim=1, N=2048,
+        deterministic=False, point_dim=14
     ):
     if deterministic:
         model = AutoEncoder(
@@ -418,6 +415,7 @@ def create_autoencoder(
             num_latents=M,
             heads=8,
             dim_head=64,
+            point_dim=point_dim,
         )
     else:
         model = KLAutoEncoder(
@@ -430,57 +428,57 @@ def create_autoencoder(
             latent_dim=latent_dim,
             heads=8,
             dim_head=64,
+            point_dim=point_dim,
         )
     return model
 
 def kl_d512_m512_l512(N=2048):
-    return create_autoencoder(dim=512, M=512, latent_dim=512, N=N, determinisitc=False)
+    return create_autoencoder(dim=512, M=512, latent_dim=512, N=N, deterministic=False)
     
 def kl_d512_m512_l64(N=2048):
-    return create_autoencoder(dim=512, M=512, latent_dim=64, N=N, determinisitc=False)
+    return create_autoencoder(dim=512, M=512, latent_dim=64, N=N, deterministic=False)
 
 def kl_d512_m512_l32(N=2048):
-    return create_autoencoder(dim=512, M=512, latent_dim=32, N=N, determinisitc=False)
+    return create_autoencoder(dim=512, M=512, latent_dim=32, N=N, deterministic=False)
 
 def kl_d512_m512_l16(N=2048):
-    return create_autoencoder(dim=512, M=512, latent_dim=16, N=N, determinisitc=False)
+    return create_autoencoder(dim=512, M=512, latent_dim=16, N=N, deterministic=False)
 
 def kl_d512_m512_l8(N=2048):
-    return create_autoencoder(dim=512, M=512, latent_dim=8, N=N, determinisitc=False)
+    return create_autoencoder(dim=512, M=512, latent_dim=8, N=N, deterministic=False)
 
 def kl_d512_m512_l4(N=2048):
-    return create_autoencoder(dim=512, M=512, latent_dim=4, N=N, determinisitc=False)
+    return create_autoencoder(dim=512, M=512, latent_dim=4, N=N, deterministic=False)
 
 def kl_d512_m512_l2(N=2048):
-    return create_autoencoder(dim=512, M=512, latent_dim=2, N=N, determinisitc=False)
+    return create_autoencoder(dim=512, M=512, latent_dim=2, N=N, deterministic=False)
 
 def kl_d512_m512_l1(N=2048):
-    return create_autoencoder(dim=512, M=512, latent_dim=1, N=N, determinisitc=False)
+    return create_autoencoder(dim=512, M=512, latent_dim=1, N=N, deterministic=False)
 
 ###
 def ae_d512_m512(N=2048):
-    return create_autoencoder(dim=512, M=512, N=N, determinisitc=True)
+    return create_autoencoder(dim=512, M=512, N=N, deterministic=True)
 
 def ae_d512_m256(N=2048):
-    return create_autoencoder(dim=512, M=256, N=N, determinisitc=True)
+    return create_autoencoder(dim=512, M=256, N=N, deterministic=True)
 
 def ae_d512_m128(N=2048):
-    return create_autoencoder(dim=512, M=128, N=N, determinisitc=True)
+    return create_autoencoder(dim=512, M=128, N=N, deterministic=True)
 
 def ae_d512_m64(N=2048):
-    return create_autoencoder(dim=512, M=64, N=N, determinisitc=True)
+    return create_autoencoder(dim=512, M=64, N=N, deterministic=True)
 
 ###
 def ae_d256_m512(N=2048):
-    return create_autoencoder(dim=256, M=512, N=N, determinisitc=True)
+    return create_autoencoder(dim=256, M=512, N=N, deterministic=True)
 
 def ae_d128_m512(N=2048):
-    return create_autoencoder(dim=128, M=512, N=N, determinisitc=True)
+    return create_autoencoder(dim=128, M=512, N=N, deterministic=True)
 
 def ae_d64_m512(N=2048):
-    return create_autoencoder(dim=64, M=512, N=N, determinisitc=True)
+    return create_autoencoder(dim=64, M=512, N=N, deterministic=True)
 
 # low-resolution autoencoder
 def ae_d64_m64(N=2048):
-    return create_autoencoder(dim=128, M=128, depth=4, output_dim=3, N=N, determinisitc=True)
-
+    return create_autoencoder(dim=128, M=128, depth=4, output_dim=3, N=N, deterministic=True)

@@ -20,6 +20,7 @@ from safetensors.torch import load_file
 from gaussianwm.vq_model import LPIPS
 
 from gaussianwm.diffusion.denoiser import Denoiser, DenoiserConfig, SigmaDistributionConfig
+from gaussianwm.physics import PhysicsAugmentor
 from gaussianwm.diffusion.diffusion_sampler import DiffusionSampler, DiffusionSamplerConfig
 from gaussianwm.diffusion.models import DiT_models, InnerModelConfig
 from gaussianwm.reward.reward_model import RewardModel, RewardModelConfig
@@ -78,8 +79,16 @@ class GaussianPredictor(nn.Module):
                 action_dim=args.action_dim,
             )
 
+        # Physics augmentation
+        self.physics_augmentor = PhysicsAugmentor(args.physics) if hasattr(args, 'physics') else None
+        if self.physics_augmentor and self.physics_augmentor.enabled:
+            from gaussianwm.physics.gpt4v_predictor import get_physics_dim
+            physics_dim = get_physics_dim(args.physics.feature_mode)
+        else:
+            physics_dim = 0
+
         # Splatt3r and VAE
-        self.gaussian_feature_dim = 14
+        self.gaussian_feature_dim = 14 + physics_dim
         if args.observation.use_gs:
             from gaussianwm.processor.regressor import Splatt3rRegressor, gaussian_feature_to_dim
             self.splatt3r = Splatt3rRegressor().to(device).eval()
@@ -89,13 +98,13 @@ class GaussianPredictor(nn.Module):
             self.num_latents = args.vae.num_latents
             self.vae = create_autoencoder(
                 depth=args.vae.vae_depth,
-                # dim=self.gaussian_feature_dim,
                 dim=self.latent_dim,
                 M=self.num_latents,
                 latent_dim=self.latent_dim,
                 output_dim=self.gaussian_feature_dim,
                 N=args.observation.point_cloud_size,
-                deterministic=not args.vae.use_kl
+                deterministic=not args.vae.use_kl,
+                point_dim=self.gaussian_feature_dim,  # 14 or 26
             ).to(device)
             self.vae_optimizer = torch.optim.AdamW(self.vae.parameters(), lr=args.optimizer.tok_lr)
             cprint(f"[VAE] Trainable parameters: {sum(p.numel() for p in self.vae.parameters() if p.requires_grad)/1e6}M", 'yellow')
@@ -103,7 +112,7 @@ class GaussianPredictor(nn.Module):
 
         # Modify denoiser config for latent space if using either component
         if args.observation.use_gs:
-            denoiser_config.inner_model.in_channels = 14
+            denoiser_config.inner_model.in_channels = self.gaussian_feature_dim
             if args.reward.use_reward_model:
                 reward_model_config.img_channels = 14
         if args.vae.use_vae:
@@ -164,32 +173,45 @@ class GaussianPredictor(nn.Module):
             self.reward_model_optimizer = torch.optim.AdamW(self.reward_model.parameters(), lr=args.optimizer.reward_model_lr)
 
 
-    def _process_obs(self, obs):
+    def _process_obs(self, obs, precomputed_points=None):
         """Convert RGB obs to latent embeddings with Gaussian processing (batched version)"""
         B, T, C, H, W = obs.shape
-        embeddings = None
-        
-        if self.args.observation.use_gs:
+
+        if not self.args.observation.use_gs:
+            return obs  # [B, T, C, H, W]
+
+        obs_flat = obs.view(B*T, C, H, W)
+
+        # ── Step 1: Splatt3R → 14-dim Gaussian features ──────────────────────
+        # bug fix：接受预计算的 points，避免 forward() 里重复跑 Splatt3R
+        if precomputed_points is not None:
+            points = precomputed_points
+        else:
             with torch.no_grad():
-                obs_flat = obs.view(B*T, C, H, W)
-                # Get Gaussian features
                 points, _ = self.splatt3r.forward_tensor(obs_flat)  # [B*T, N, 14]
 
-            if self.args.vae.use_vae:   # Get latent representation
-                enc = self.vae.encode(points)
-                if isinstance(enc, tuple):
-                    enc = enc[0]  # [B, T, N, C]
-                enc = enc.view(B, T, -1, enc.shape[-1])
-                embeddings = enc.permute(0, 1, 3, 2).contiguous().view(B, T, enc.shape[-1], self.nh, self.nw)
-                # [B, T, C, H, W]
-            else:
-                # [B*T, N=H*W, C=14] -> [B, T, C=14, H, W]
-                embeddings = points.view(B, T, -1, points.shape[-1]).permute(0, 1, 3, 2).contiguous()
-                # [B, T, C, N]
-                embeddings = embeddings.view(B, T, points.shape[-1], H, W)  # [B, T, C, H, W]
-                # print(f"{embeddings.shape=}")
+        # ── Step 2: physics augmentation (optional) ───────────────────────────
+        # feature_mode="material" → +10 dims (one-hot only)   → [B*T, N, 24]
+        # feature_mode="full"     → +12 dims (one-hot+hardness+shore) → [B*T, N, 26]
+        # use_physics=false       → skip, stay at [B*T, N, 14]
+        if self.physics_augmentor is not None and self.physics_augmentor.enabled:
+            points = self.physics_augmentor.augment(obs_flat * 255., points)
+
+        # ── Step 3: VAE encoding (optional) ───────────────────────────────────
+        if self.args.vae.use_vae:
+            enc = self.vae.encode(points)
+            if isinstance(enc, tuple):
+                # KLAutoEncoder returns (kl, z, sampled_pc); we want z
+                enc = enc[1]                          # [B*T, M, latent_dim]
+            enc = enc.view(B, T, -1, enc.shape[-1])  # [B, T, M, latent_dim]
+            embeddings = enc.permute(0, 1, 3, 2).contiguous().view(
+                B, T, enc.shape[-1], self.nh, self.nw
+            )                                         # [B, T, latent_dim, nh, nw]
         else:
-            embeddings = obs  # [B, T, C, H, W]
+            # no VAE: reshape [B*T, N, D] → [B, T, D, H, W]
+            D = points.shape[-1]
+            embeddings = points.view(B, T, -1, D).permute(0, 1, 3, 2).contiguous()
+            embeddings = embeddings.view(B, T, D, H, W)
 
         return embeddings
 
@@ -225,25 +247,33 @@ class GaussianPredictor(nn.Module):
         # Get Gaussian features from Splatt3r
         with torch.no_grad():
             points, _ = self.splatt3r.forward_tensor(obs_flat) # e.g., [160, 4096, 14]
-            # points = torch.cat([points_1, points_2], dim=1)
+
+        # Physics augmentation（与 _process_obs 保持一致）
+        if self.physics_augmentor is not None and self.physics_augmentor.enabled:
+            points = self.physics_augmentor.augment(obs_flat * 255., points)
 
         # VAE reconstruction
-        # z, _, commit_loss = self.vae.encode(points)
-        z = self.vae.encode(points) # e.g., [160, 512, 256]
-        recon = self.vae.decode(z) #queries=points)
-        
+        enc = self.vae.encode(points)   # AutoEncoder → tensor; KLAutoEncoder → (kl, z, sampled_pc)
+        if isinstance(enc, tuple):
+            kl_loss, z, sampled_pc = enc
+            recon = self.vae.decode(z, queries=sampled_pc)  # decode back to full point cloud
+        else:
+            kl_loss = torch.tensor(0.0, device=self.device)
+            z       = enc
+            recon   = self.vae.decode(z)
+
         # Reconstruction loss on Gaussian parameters
         recon_loss = F.mse_loss(recon, points)
-        # loss = recon_loss + args.commit_weight * commit_loss
-        loss = recon_loss
+        kl_weight  = getattr(args.vae, 'kl_weight', 1e-4)
+        loss = recon_loss + kl_weight * kl_loss.mean()
 
         loss.backward()
         self.vae_optimizer.step()
 
         return {
             'tokenizer_loss': loss.item(),
-            'recon_loss': recon_loss.item(),
-            # 'commit_loss': commit_loss.item()
+            'recon_loss':     recon_loss.item(),
+            'kl_loss':        kl_loss.mean().item(),
         }
 
     def update_model(self, args, obs, action, reward, pad_mask=None):
@@ -323,18 +353,29 @@ class GaussianPredictor(nn.Module):
             with torch.no_grad():
                 points, _ = self.splatt3r.forward_tensor(obs_flat)
 
-            # VAE reconstruction
-            z = self.vae.encode(points)
-            recon = self.vae.decode(z)
-            
-            # Reconstruction loss on Gaussian parameters
+            # Physics augmentation（与 _process_obs 保持一致）
+            if self.physics_augmentor is not None and self.physics_augmentor.enabled:
+                points = self.physics_augmentor.augment(obs_flat * 255., points)
+
+            # VAE reconstruction (same fix as update_vae)
+            enc = self.vae.encode(points)
+            if isinstance(enc, tuple):
+                kl_loss, z, sampled_pc = enc
+                recon = self.vae.decode(z, queries=sampled_pc)
+            else:
+                kl_loss = torch.tensor(0.0, device=self.device)
+                z       = enc
+                recon   = self.vae.decode(z)
+
+            kl_weight  = getattr(self.args.vae, 'kl_weight', 1e-4)
             recon_loss = F.mse_loss(recon, points)
-            vae_loss = recon_loss
+            vae_loss   = recon_loss + kl_weight * kl_loss.mean()
             total_loss += vae_loss
-            
+
             metrics.update({
                 'tokenizer_loss': vae_loss.item(),
-                'recon_loss': recon_loss.item(),
+                'recon_loss':     recon_loss.item(),
+                'kl_loss':        kl_loss.mean().item(),
             })
 
         # Calculate model loss without optimization
@@ -342,9 +383,11 @@ class GaussianPredictor(nn.Module):
             self.model.train()
             if self.args.reward.use_reward_model:
                 self.reward_model.train()
-            
-            # Process observations to latent space
-            latent_embeddings = self._process_obs(obs)  # [B, T, D] or [B, T, C, H, W]
+
+            # bug fix：如果 VAE 分支已经算过 points，直接复用，避免 Splatt3R 跑两次
+            precomputed = points if (update_tokenizer and self.args.vae.use_vae
+                                     and self.args.observation.use_gs) else None
+            latent_embeddings = self._process_obs(obs, precomputed_points=precomputed)
             
             # Forward through diffusion model
             diff_loss = self.model(
@@ -377,7 +420,8 @@ class GaussianPredictor(nn.Module):
 
         metrics.update({
             "total_loss": total_loss.item(),
-            "diff_loss": diff_loss.item(),
+            # bug fix: diff_loss 只在 update_model=True 时存在
+            **({"diff_loss": diff_loss.item()} if update_model else {}),
         })
         
         return total_loss, metrics
@@ -444,7 +488,7 @@ class GaussianPredictor(nn.Module):
             else:
                 reward_pred = torch.zeros_like(action[:, 0])
 
-            frames.append(next_obs.clamp(0.0, 1.0))
+            frames.append(next_obs)  # bug fix: latent 不应被 clamp(0,1)，会截断负值
             frames.pop(0)
             obss.append(torch.cat(frames[-args.context_length:], dim=1))
             actions.append(action)
@@ -458,12 +502,21 @@ class GaussianPredictor(nn.Module):
         return torch.stack(obss, 1).float(), torch.stack(actions, 1).float(), torch.stack(rewards, 1).float()
 
     def save_snapshot(self, workdir, suffix=''):
-        # Save unwrapped model if using DDP
-        model_to_save = self.module if isinstance(self, DDP) else self
-        torch.save(model_to_save.model.state_dict(), os.path.join(workdir, f'model{suffix}.pt'))
+        # bug fix：原来只存 diffusion model，VAE 和 reward model 丢失
+        # bug fix：DDP 解包判断对象应为传入的 wrapper，这里用 getattr 兼容两种情况
+        unwrapped = getattr(self, 'module', self)
+        snapshot = {'model': unwrapped.model.state_dict()}
+        if self.args.vae.use_vae:
+            snapshot['vae'] = unwrapped.vae.state_dict()
+        if self.args.reward.use_reward_model:
+            snapshot['reward_model'] = unwrapped.reward_model.state_dict()
+        torch.save(snapshot, os.path.join(workdir, f'snapshot{suffix}.pt'))
 
     def load_snapshot(self, workdir, suffix=''):
-        # Load works for both DDP and single GPU
-        state_dict = torch.load(os.path.join(workdir, f'model{suffix}.pt'), 
-                              map_location=f'cuda:{dist.get_rank()}' if dist.is_initialized() else 'cpu')
-        self.model.load_state_dict(state_dict)
+        map_loc = f'cuda:{dist.get_rank()}' if dist.is_initialized() else 'cpu'
+        snapshot = torch.load(os.path.join(workdir, f'snapshot{suffix}.pt'), map_location=map_loc)
+        self.model.load_state_dict(snapshot['model'])
+        if self.args.vae.use_vae and 'vae' in snapshot:
+            self.vae.load_state_dict(snapshot['vae'])
+        if self.args.reward.use_reward_model and 'reward_model' in snapshot:
+            self.reward_model.load_state_dict(snapshot['reward_model'])

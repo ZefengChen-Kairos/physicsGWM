@@ -1,11 +1,9 @@
 # Configuration for Gaussian World Model predictor
-# world_model:
 _target_: gwm_predictor.GaussianPredictor
 
 model_type: gwm
 # Model architecture
 model:
-  # model_type: DiT_S_2 # One of the DiT model types
   input_size: ${dataset.image_size}
   in_channels: 3
   patch_size: 4
@@ -26,11 +24,25 @@ vae:
   use_vae: false
   num_latents: 16384
   latent_dim: 256
-  vae_depth: 2  # renamed from num_res_blocks
-  # use_kl: true
+  vae_depth: 2
   use_kl: false
   commit_weight: 0.25
-  # perceptual_weight: 0.1
+  kl_weight: 1e-4    # 新增：KL 散度损失权重
+
+# Physics augmentation parameters (GaussianProperty integration)
+# 改动：原始文件没有这个块，这里新增
+physics:
+  use_physics: false       # 总开关，改成 true 开启
+  gpt4v_api_key: null      # OpenAI key，null 则全部填零
+  vlm_type: "gpt"          # "gpt" 或 "qwen"
+  gpt4v_model: "gpt-4o-mini"
+  sam_ckpt_path: "./sam_vit_h_4b8939.pth"
+  cache_dir: "./physics_cache"
+  device: "cuda"
+  # feature_mode 控制编码哪些信息：
+  #   "material" → 只用材质 one-hot（10维）→ Gaussian: 14+10=24
+  #   "full"     → 材质 + 硬度 + Shore 类型（12维）→ Gaussian: 14+12=26
+  feature_mode: "material"
 
 # Reward model parameters
 reward:
@@ -38,16 +50,9 @@ reward:
   reward_weight: 1.0
 
 # Training parameters
-# training:
 symlog: true
-# batch_size: 16  # slow 2x?
-# batch_size: 8
 batch_size: 4
 selected_params: true
-# segment_length: 12
-# context_length: 2
-# segment_length: 2
-# context_length: 1
 segment_length: ${dataset.segment_length}
 context_length: ${dataset.context_length}
 action_dim: ${dataset.action_dim}
@@ -67,25 +72,20 @@ diffusion:
 
 # Optimizer parameters
 optimizer:
-  # VAE/Tokenizer optimizer
   tok_lr: 1e-4
   tok_wd: 0.0
   tok_beta1: 0.9
   tok_beta2: 0.999
-  
-  # Model optimizer
   model_lr: 1e-4
   model_wd: 0.0
   embed_no_wd: false
   max_grad_norm: 10.0
-  
-  # Reward model optimizer
   reward_model_lr: 1e-4
   reward_model_wd: 0.0
 
 # Sampling parameters for inference
 sampling:
-  s_churn: 0.0  # amount of stochasticity
+  s_churn: 0.0
   s_tmin: 0.0
   s_tmax: 5.0
   s_noise: 1.0
